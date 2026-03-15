@@ -1,0 +1,13 @@
+[Unit]
+Description=VK Comment Monitor Bot
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/vk-comment-monitor
+ExecStart=/opt/vk-comment-monitor/.venv/bin/python3 /opt/vk-comment-monitor/bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
