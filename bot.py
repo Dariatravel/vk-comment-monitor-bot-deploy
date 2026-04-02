@@ -402,16 +402,19 @@ class VkApi:
         return response.get("items", [])
 
     def get_latest_comment_id(self, owner_id: int, post_id: int) -> int:
-        response = self._api_call(
-            "wall.getComments",
-            {
-                "owner_id": owner_id,
-                "post_id": post_id,
-                "count": 1,
-                "sort": "desc",
-            },
-            token=self.config.reader_token,
-        )
+        try:
+            response = self._api_call(
+                "wall.getComments",
+                {
+                    "owner_id": owner_id,
+                    "post_id": post_id,
+                    "count": 1,
+                    "sort": "desc",
+                },
+                token=self.config.reader_token,
+            )
+        except BotError as error:
+            self._raise_reader_token_hint(error)
         items = response.get("items", [])
         if not items:
             return 0
@@ -429,19 +432,22 @@ class VkApi:
         offset = 0
 
         while True:
-            response = self._api_call(
-                "wall.getComments",
-                {
-                    "owner_id": owner_id,
-                    "post_id": post_id,
-                    "count": 100,
-                    "offset": offset,
-                    "sort": "desc",
-                    "extended": 1,
-                    "fields": "screen_name",
-                },
-                token=self.config.reader_token,
-            )
+            try:
+                response = self._api_call(
+                    "wall.getComments",
+                    {
+                        "owner_id": owner_id,
+                        "post_id": post_id,
+                        "count": 100,
+                        "offset": offset,
+                        "sort": "desc",
+                        "extended": 1,
+                        "fields": "screen_name",
+                    },
+                    token=self.config.reader_token,
+                )
+            except BotError as error:
+                self._raise_reader_token_hint(error)
             items = response.get("items", [])
             for profile in response.get("profiles", []):
                 profiles[int(profile["id"])] = profile
@@ -462,6 +468,16 @@ class VkApi:
 
         comments.sort(key=lambda item: int(item["id"]))
         return comments, profiles, groups
+
+    def _raise_reader_token_hint(self, error: BotError) -> None:
+        message = str(error)
+        uses_group_token_for_reader = self.config.reader_token == self.config.group_token
+        if "VK API error 27" in message and uses_group_token_for_reader:
+            raise BotError(
+                "Не хватает VK_READER_TOKEN. Для чужих постов нужен пользовательский токен "
+                "с правом wall (добавьте переменную VK_READER_TOKEN в Railway)."
+            ) from error
+        raise error
 
 
 class MonitorBot:
