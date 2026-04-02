@@ -75,6 +75,7 @@ class Config:
     group_id: int
     group_token: str
     reader_token: str
+    allowed_user_id: int
     access_code: str
     api_version: str
     check_interval_seconds: int
@@ -457,6 +458,8 @@ class MonitorBot:
             last_message_id = int(conversation.get("last_message_id", 0))
             if user_id <= 0 or last_message_id <= 0:
                 continue
+            if user_id != self.config.allowed_user_id:
+                continue
 
             saved_message_id = self.storage.get_last_seen_message_id(user_id)
             if saved_message_id == 0:
@@ -484,6 +487,8 @@ class MonitorBot:
             self.storage.set_last_seen_message_id(user_id, last_message_id)
 
     def handle_incoming_message(self, user_id: int, message: dict) -> None:
+        if user_id != self.config.allowed_user_id:
+            return
         text = (message.get("text") or "").strip()
 
         try:
@@ -498,6 +503,9 @@ class MonitorBot:
             self.vk.send_message(user_id, reply)
 
     def handle_message(self, user_id: int, text: str) -> str:
+        if user_id != self.config.allowed_user_id:
+            return ""
+
         normalized = text.lower()
         access_command = f"доступ {self.config.access_code}".lower()
 
@@ -592,6 +600,9 @@ class MonitorBot:
             post_id = int(row["post_id"])
             last_seen_comment_id = int(row["last_seen_comment_id"])
             user_ids = [int(value) for value in row["user_ids"].split(",") if value]
+            user_ids = [user_id for user_id in user_ids if user_id == self.config.allowed_user_id]
+            if not user_ids:
+                continue
 
             try:
                 comments, profiles, groups = self.vk.get_new_comments(
@@ -686,6 +697,7 @@ def build_config() -> Config:
     group_id = int(require_env("VK_GROUP_ID"))
     group_token = require_env("VK_GROUP_TOKEN")
     reader_token = os.getenv("VK_READER_TOKEN", "").strip() or group_token
+    allowed_user_id = int(require_env("ALLOWED_USER_ID"))
     access_code = require_env("ACCESS_CODE")
     api_version = os.getenv("VK_API_VERSION", "5.199")
     check_interval_seconds = int(os.getenv("CHECK_INTERVAL_SECONDS", "90"))
@@ -699,6 +711,7 @@ def build_config() -> Config:
         group_id=group_id,
         group_token=group_token,
         reader_token=reader_token,
+        allowed_user_id=allowed_user_id,
         access_code=access_code,
         api_version=api_version,
         check_interval_seconds=check_interval_seconds,
