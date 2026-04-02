@@ -51,6 +51,7 @@ cp .env.example .env
 - `VK_GROUP_TOKEN`
 - `VK_READER_TOKEN`
 - `ALLOWED_USER_ID`
+- `STRICT_DIALOG_MODE`
 - `ACCESS_CODE`
 
 ## 6. Проверьте ручной запуск

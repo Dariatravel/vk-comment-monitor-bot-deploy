@@ -52,6 +52,15 @@ def require_env(name: str, default: Optional[str] = None) -> str:
     return value
 
 
+def parse_bool_env(value: str, name: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise BotError(f"Некорректное булево значение для {name}: {value}")
+
+
 def normalize_url(owner_id: int, post_id: int) -> str:
     return f"https://vk.com/wall{owner_id}_{post_id}"
 
@@ -76,6 +85,7 @@ class Config:
     group_token: str
     reader_token: str
     allowed_user_id: int
+    strict_dialog_mode: bool
     access_code: str
     api_version: str
     check_interval_seconds: int
@@ -127,6 +137,12 @@ class Storage:
                 CREATE TABLE IF NOT EXISTS authorized_users (
                     user_id INTEGER PRIMARY KEY,
                     authorized_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS bot_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 );
                 """
             )
@@ -307,6 +323,35 @@ class Storage:
                 (user_id, now),
             )
 
+    def get_setting(self, key: str) -> Optional[str]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM bot_settings WHERE key = ?",
+                (key,),
+            ).fetchone()
+            return str(row["value"]) if row else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        now = datetime.utcnow().isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO bot_settings (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (key, value, now),
+            )
+
+    def get_locked_dialog_peer_id(self) -> Optional[int]:
+        value = self.get_setting("locked_dialog_peer_id")
+        return int(value) if value is not None else None
+
+    def set_locked_dialog_peer_id(self, peer_id: int) -> None:
+        self.set_setting("locked_dialog_peer_id", str(peer_id))
+
 
 class VkApi:
     def __init__(self, config: Config) -> None:
@@ -424,6 +469,12 @@ class MonitorBot:
         self.config = config
         self.storage = Storage(config.database_path)
         self.vk = VkApi(config)
+        if (
+            self.config.strict_dialog_mode
+            and self.storage.get_locked_dialog_peer_id() is None
+            and self.storage.is_authorized(self.config.allowed_user_id)
+        ):
+            self.storage.set_locked_dialog_peer_id(self.config.allowed_user_id)
 
     def run(self) -> None:
         next_scan_at = 0.0
@@ -442,57 +493,51 @@ class MonitorBot:
             time.sleep(1)
 
     def poll_messages(self) -> None:
+        user_id = self.config.allowed_user_id
         try:
-            conversations = self.vk.get_conversations(count=100)
+            history = self.vk.get_history(user_id, count=50)
         except (BotError, requests.RequestException) as error:
             print(f"Не удалось проверить сообщения: {error}", file=sys.stderr)
             return
 
-        for item in conversations:
-            conversation = item.get("conversation", {})
-            peer = conversation.get("peer", {})
-            if peer.get("type") != "user":
-                continue
+        if not history:
+            return
 
-            user_id = int(peer.get("id", 0))
-            last_message_id = int(conversation.get("last_message_id", 0))
-            if user_id <= 0 or last_message_id <= 0:
-                continue
-            if user_id != self.config.allowed_user_id:
-                continue
+        latest_message_id = max(int(message.get("id", 0)) for message in history)
+        if latest_message_id <= 0:
+            return
 
-            saved_message_id = self.storage.get_last_seen_message_id(user_id)
-            if saved_message_id == 0:
-                self.storage.set_last_seen_message_id(user_id, last_message_id)
-                continue
-            if last_message_id <= saved_message_id:
-                continue
+        saved_message_id = self.storage.get_last_seen_message_id(user_id)
+        if saved_message_id == 0:
+            self.storage.set_last_seen_message_id(user_id, latest_message_id)
+            return
+        if latest_message_id <= saved_message_id:
+            return
 
-            try:
-                history = self.vk.get_history(user_id, count=20)
-            except (BotError, requests.RequestException) as error:
-                print(f"Не удалось прочитать диалог {user_id}: {error}", file=sys.stderr)
-                continue
+        new_messages = [
+            message
+            for message in history
+            if int(message.get("id", 0)) > saved_message_id and int(message.get("out", 0)) == 0
+        ]
+        new_messages.sort(key=lambda message: int(message["id"]))
 
-            new_messages = [
-                message
-                for message in history
-                if int(message.get("id", 0)) > saved_message_id and int(message.get("out", 0)) == 0
-            ]
-            new_messages.sort(key=lambda message: int(message["id"]))
+        for message in new_messages:
+            self.handle_incoming_message(user_id, message)
 
-            for message in new_messages:
-                self.handle_incoming_message(user_id, message)
-
-            self.storage.set_last_seen_message_id(user_id, last_message_id)
+        self.storage.set_last_seen_message_id(user_id, latest_message_id)
 
     def handle_incoming_message(self, user_id: int, message: dict) -> None:
         if user_id != self.config.allowed_user_id:
             return
+        peer_id = int(message.get("peer_id", user_id))
+        if self.config.strict_dialog_mode:
+            locked_peer_id = self.storage.get_locked_dialog_peer_id()
+            if locked_peer_id is not None and peer_id != locked_peer_id:
+                return
         text = (message.get("text") or "").strip()
 
         try:
-            reply = self.handle_message(user_id, text)
+            reply = self.handle_message(user_id, text, peer_id=peer_id)
         except BotError as error:
             reply = f"Ошибка: {error}"
         except Exception as error:  # noqa: BLE001
@@ -502,15 +547,27 @@ class MonitorBot:
         if reply:
             self.vk.send_message(user_id, reply)
 
-    def handle_message(self, user_id: int, text: str) -> str:
+    def handle_message(self, user_id: int, text: str, peer_id: Optional[int] = None) -> str:
         if user_id != self.config.allowed_user_id:
+            return ""
+
+        effective_peer_id = peer_id if peer_id is not None else user_id
+        locked_peer_id = self.storage.get_locked_dialog_peer_id() if self.config.strict_dialog_mode else None
+        if self.config.strict_dialog_mode and locked_peer_id is not None and effective_peer_id != locked_peer_id:
             return ""
 
         normalized = text.lower()
         access_command = f"доступ {self.config.access_code}".lower()
 
         if normalized == access_command:
+            if self.config.strict_dialog_mode and locked_peer_id is None:
+                self.storage.set_locked_dialog_peer_id(effective_peer_id)
             self.storage.authorize_user(user_id)
+            if self.config.strict_dialog_mode and locked_peer_id is None:
+                return (
+                    "Доступ открыт. Диалог закреплён в жёстком режиме. "
+                    "Команды принимаются только из этого диалога."
+                )
             return "Доступ открыт. Теперь можно присылать ссылку на пост или команду `помощь`."
 
         if not self.storage.is_authorized(user_id):
@@ -698,6 +755,7 @@ def build_config() -> Config:
     group_token = require_env("VK_GROUP_TOKEN")
     reader_token = os.getenv("VK_READER_TOKEN", "").strip() or group_token
     allowed_user_id = int(require_env("ALLOWED_USER_ID"))
+    strict_dialog_mode = parse_bool_env(os.getenv("STRICT_DIALOG_MODE", "1"), "STRICT_DIALOG_MODE")
     access_code = require_env("ACCESS_CODE")
     api_version = os.getenv("VK_API_VERSION", "5.199")
     check_interval_seconds = int(os.getenv("CHECK_INTERVAL_SECONDS", "90"))
@@ -712,6 +770,7 @@ def build_config() -> Config:
         group_token=group_token,
         reader_token=reader_token,
         allowed_user_id=allowed_user_id,
+        strict_dialog_mode=strict_dialog_mode,
         access_code=access_code,
         api_version=api_version,
         check_interval_seconds=check_interval_seconds,
