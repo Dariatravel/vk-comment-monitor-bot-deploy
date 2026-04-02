@@ -480,6 +480,11 @@ class VkApi:
                 "Не хватает VK_READER_TOKEN. Для чужих постов нужен пользовательский токен "
                 "с правом wall (добавьте переменную VK_READER_TOKEN в Railway)."
             ) from error
+        if "VK API error 5" in message and "another ip address" in message.lower():
+            raise BotError(
+                "VK_READER_TOKEN привязан к другому IP. Выпустите новый токен и сразу обновите "
+                "переменную VK_READER_TOKEN в Railway, не используя этот токен локально."
+            ) from error
         raise error
 
 
