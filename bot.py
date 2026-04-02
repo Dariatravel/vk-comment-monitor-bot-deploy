@@ -3,6 +3,7 @@ import re
 import sqlite3
 import sys
 import time
+from hashlib import sha256
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -86,6 +87,8 @@ class Config:
     reader_token: str
     allowed_user_id: int
     strict_dialog_mode: bool
+    reader_token_ttl_seconds: int
+    reader_token_warn_before_seconds: int
     access_code: str
     api_version: str
     check_interval_seconds: int
@@ -491,10 +494,75 @@ class MonitorBot:
             and self.storage.is_authorized(self.config.allowed_user_id)
         ):
             self.storage.set_locked_dialog_peer_id(self.config.allowed_user_id)
+        self._sync_reader_token_tracking()
+
+    def _sync_reader_token_tracking(self) -> None:
+        if self.config.reader_token == self.config.group_token:
+            return
+        token_hash = sha256(self.config.reader_token.encode("utf-8")).hexdigest()
+        saved_hash = self.storage.get_setting("reader_token_hash")
+        if saved_hash == token_hash:
+            return
+        now_ts = int(time.time())
+        self.storage.set_setting("reader_token_hash", token_hash)
+        self.storage.set_setting("reader_token_seen_at", str(now_ts))
+        self.storage.set_setting("reader_token_notify_stage", "none")
+
+    def check_reader_token_health(self, now_ts: Optional[int] = None) -> None:
+        if self.config.reader_token == self.config.group_token:
+            return
+        if self.config.reader_token_ttl_seconds <= 0:
+            return
+
+        self._sync_reader_token_tracking()
+        seen_at_raw = self.storage.get_setting("reader_token_seen_at")
+        if seen_at_raw is None:
+            return
+        try:
+            seen_at = int(seen_at_raw)
+        except ValueError:
+            return
+
+        current_ts = int(time.time()) if now_ts is None else int(now_ts)
+        expires_at = seen_at + self.config.reader_token_ttl_seconds
+        warning_at = expires_at - self.config.reader_token_warn_before_seconds
+        notify_stage = self.storage.get_setting("reader_token_notify_stage") or "none"
+
+        if current_ts >= expires_at and notify_stage != "expired":
+            expires_label = datetime.utcfromtimestamp(expires_at).strftime("%d.%m %H:%M UTC")
+            message = (
+                "VK_READER_TOKEN истёк. Мониторинг комментариев чужих постов может перестать работать.\n"
+                f"Ожидаемое время истечения: {expires_label}\n"
+                "Обновите переменную VK_READER_TOKEN в Railway."
+            )
+            try:
+                self.vk.send_message(self.config.allowed_user_id, message)
+                self.storage.set_setting("reader_token_notify_stage", "expired")
+            except (BotError, requests.RequestException) as error:
+                print(f"Не удалось отправить уведомление об истечении VK_READER_TOKEN: {error}", file=sys.stderr)
+            return
+
+        if current_ts >= warning_at and notify_stage == "none":
+            seconds_left = max(0, expires_at - current_ts)
+            hours_left = seconds_left // 3600
+            minutes_left = (seconds_left % 3600) // 60
+            expires_label = datetime.utcfromtimestamp(expires_at).strftime("%d.%m %H:%M UTC")
+            message = (
+                "VK_READER_TOKEN скоро истечёт.\n"
+                f"Осталось примерно: {hours_left} ч {minutes_left} мин\n"
+                f"Ожидаемое время истечения: {expires_label}\n"
+                "Подготовьте новый токен и обновите переменную VK_READER_TOKEN в Railway."
+            )
+            try:
+                self.vk.send_message(self.config.allowed_user_id, message)
+                self.storage.set_setting("reader_token_notify_stage", "warning")
+            except (BotError, requests.RequestException) as error:
+                print(f"Не удалось отправить предупреждение об истечении VK_READER_TOKEN: {error}", file=sys.stderr)
 
     def run(self) -> None:
         next_scan_at = 0.0
         next_message_poll_at = 0.0
+        next_reader_token_health_check_at = 0.0
 
         print("Бот запущен. Проверяю сообщения и комментарии.")
         while True:
@@ -505,6 +573,9 @@ class MonitorBot:
             if now >= next_message_poll_at:
                 self.poll_messages()
                 next_message_poll_at = now + self.config.message_check_interval_seconds
+            if now >= next_reader_token_health_check_at:
+                self.check_reader_token_health(now_ts=int(now))
+                next_reader_token_health_check_at = now + 60
 
             time.sleep(1)
 
@@ -772,6 +843,8 @@ def build_config() -> Config:
     reader_token = os.getenv("VK_READER_TOKEN", "").strip() or group_token
     allowed_user_id = int(require_env("ALLOWED_USER_ID"))
     strict_dialog_mode = parse_bool_env(os.getenv("STRICT_DIALOG_MODE", "1"), "STRICT_DIALOG_MODE")
+    reader_token_ttl_seconds = int(os.getenv("VK_READER_TOKEN_TTL_SECONDS", "86400"))
+    reader_token_warn_before_seconds = int(os.getenv("VK_READER_TOKEN_WARN_BEFORE_SECONDS", "10800"))
     access_code = require_env("ACCESS_CODE")
     api_version = os.getenv("VK_API_VERSION", "5.199")
     check_interval_seconds = int(os.getenv("CHECK_INTERVAL_SECONDS", "90"))
@@ -780,6 +853,10 @@ def build_config() -> Config:
 
     if not database_path.is_absolute():
         database_path = Path(__file__).parent / database_path
+    if reader_token_ttl_seconds < 0:
+        raise BotError("VK_READER_TOKEN_TTL_SECONDS не может быть отрицательным")
+    if reader_token_warn_before_seconds < 0:
+        raise BotError("VK_READER_TOKEN_WARN_BEFORE_SECONDS не может быть отрицательным")
 
     return Config(
         group_id=group_id,
@@ -787,6 +864,8 @@ def build_config() -> Config:
         reader_token=reader_token,
         allowed_user_id=allowed_user_id,
         strict_dialog_mode=strict_dialog_mode,
+        reader_token_ttl_seconds=reader_token_ttl_seconds,
+        reader_token_warn_before_seconds=reader_token_warn_before_seconds,
         access_code=access_code,
         api_version=api_version,
         check_interval_seconds=check_interval_seconds,
